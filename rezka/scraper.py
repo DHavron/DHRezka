@@ -5,8 +5,8 @@ HTML-парсер страниц rezka-ua.tv: поиск, каталог, нов
 обычный requests может не пройти. Варианты:
 
 1. Использовать рабочее зеркало без challenge (см. MIRROR_HOSTS).
-2. Пробросить cookies из настоящего браузера (файл cookies.txt в формате
-   Netscape или строка cookie) — см. load_cookies().
+2. Пробросить cookies из настоящего браузера (строка cookie или файл
+   Netscape cookies.txt) — см. rezka.net.make_session().
 3. Запускать браузер через Selenium/Playwright и подставлять session.
 
 Класс RezkaScraper работает с любым requests.Session — можно передать
@@ -15,15 +15,16 @@ HTML-парсер страниц rezka-ua.tv: поиск, каталог, нов
 
 from __future__ import annotations
 
-import http.cookiejar
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import requests
 from bs4 import BeautifulSoup
 
-from .api import BASE_SITE, DEFAULT_HEADERS
+from .api import BASE_SITE
+from .net import (AntiBotError, load_cookies, make_session,  # noqa: F401
+                  raise_for_antibot)
 
 
 @dataclass
@@ -40,50 +41,6 @@ class SearchResult:
     extra: str = ""            # "сериалы / 2 сезон 8 серия" и т.п.
 
 
-def load_cookies(cookie_file: str) -> http.cookiejar.CookieJar:
-    """Загрузить cookies в формате Netscape (расширение EditThisCookie/browsercookie)."""
-    jar = http.cookiejar.MozillaCookieJar(cookie_file)
-    jar.load(cookie_file, ignore_discard=True, ignore_expires=True)
-    return jar
-
-
-def make_session(cookie_string: Optional[str] = None,
-                 cookie_file: Optional[str] = None,
-                 impersonate: bool = True) -> requests.Session:
-    """Собрать сессию с заголовками браузера и (опционально) cookies.
-
-    cookie_string — значение заголовка Cookie, скопированное из DevTools
-    после прохождения JS-challenge в браузере.
-
-    Если установлен curl_cffi и impersonate=True, используется TLS-подпись
-    Chrome — это помогает на зеркалах без тяжёлого JS-challenge.
-    При наличии cloudscraper он также применяется как можно проще.
-    """
-    sess: requests.Session
-    if impersonate:
-        try:
-            from curl_cffi.requests import Session as CSession
-            sess = CSession(impersonate="chrome")  # type: ignore[assignment]
-        except Exception:  # noqa: BLE001
-            try:
-                import cloudscraper
-                sess = cloudscraper.create_scraper()
-            except Exception:  # noqa: BLE001
-                sess = requests.Session()
-    else:
-        sess = requests.Session()
-    for k, v in DEFAULT_HEADERS.items():
-        try:
-            sess.headers[k] = v
-        except Exception:  # noqa: BLE001
-            pass
-    if cookie_string:
-        sess.headers["Cookie"] = cookie_string
-    if cookie_file:
-        sess.cookies.update(load_cookies(cookie_file))
-    return sess
-
-
 class RezkaScraper:
     """Парсер HTML-страниц rezka-ua.tv (и зеркал)."""
 
@@ -96,14 +53,17 @@ class RezkaScraper:
     # ------------------------------------------------------------------ #
     def _get_soup(self, path: str) -> BeautifulSoup:
         resp = self.session.get(self.base_url + path, timeout=self.timeout)
+        # Антибот может отвечать и HTTP 403, и «вежливым» 200 с challenge-страницей,
+        # поэтому сначала проверяем содержимое, потом поднимаем HTTP-ошибку.
+        try:
+            raise_for_antibot(resp)
+        except AntiBotError as exc:
+            raise AntiBotError(
+                f"{exc} Передайте cookies из браузера (Настройки → «Заголовок "
+                "Cookie»), используйте зеркало или пройдите проверку в браузере."
+            ) from None
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
-        if "anubis" in resp.text[:3000].lower() or soup.title and "О нет" in soup.title.get_text():
-            raise RuntimeError(
-                "Страница закрыта антибот-защитой Anubis. Передайте cookies "
-                "из браузера: --cookies cookies.txt или REZKA_COOKIE=... "
-                "(см. README), либо используйте зеркало."
-            )
         return soup
 
     # ------------------------------------------------------------------ #
