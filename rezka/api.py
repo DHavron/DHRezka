@@ -29,6 +29,14 @@ from typing import Optional
 
 import requests
 
+try:  # curl_cffi даёт TLS-имперсонацию Chrome (помогает против антиботов)
+    from curl_cffi.requests import Session as CSession  # type: ignore
+except ImportError:  # pragma: no cover
+    CSession = None  # type: ignore[assignment,misc]
+
+from .net import (AntiBotError, looks_antibot, make_session,  # noqa: F401
+                  raise_for_antibot)
+
 BASE_SITE = "https://rezka-ua.tv"
 
 # Зеркала Rezka: у каждого сайта своё API-поддомен (api.<host>).
@@ -145,21 +153,56 @@ class RezkaClient:
     # ------------------------------------------------------------------ #
     # Поиск рабочего зеркала
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _copy_session(session: requests.Session, host: str) -> requests.Session:
+        """Скопировать сессию (curl_cffi / cloudscraper / requests), заменив Referer.
+
+        Копия нужна, чтобы для каждого зеркала подставить свой Referer, но
+        сохранить пользовательские заголовки (Cookie, User-Agent).
+        """
+        new: requests.Session
+        if CSession is not None and isinstance(session, CSession):
+            kw = {}
+            impersonate = getattr(session, "impersonate", None)
+            if impersonate:
+                kw["impersonate"] = impersonate
+            new = CSession(**kw)
+        else:
+            try:
+                new = type(session)()  # cloudscraper и пр.
+            except Exception:  # noqa: BLE001
+                new = requests.Session()
+        try:
+            new.headers.update(dict(session.headers))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            new.cookies.update(session.cookies)
+        except Exception:  # noqa: BLE001
+            pass
+        new.headers["Referer"] = f"https://{host}/"
+        return new
+
     @classmethod
     def find_working_host(cls, hosts: Optional[list[str]] = None,
                           probe_id: int = 10409, timeout: int = 10,
-                          session: Optional[requests.Session] = None) -> Optional[str]:
-        """Перебрать зеркала и вернуть первое, чей API отвечает валидным JSON."""
+                          session: Optional[requests.Session] = None,
+                          on_progress=None) -> Optional[str]:
+        """Перебрать зеркала и вернуть первое, чей API отвечает валидным JSON.
+
+        Ошибки отдельных зеркал (DNS, таймауты, антибот) не должны обрывать
+        проверку остальных — для каждого хоста она изолирована.
+        """
+        base = session or make_session()
         for host in (hosts or MIRROR_HOSTS):
-            # каждая проба — со своей копией заголовков Referer
-            sess = None
-            if session is not None:
-                sess = requests.Session()
-                sess.headers.update(dict(session.headers))
-                sess.cookies.update(session.cookies)
-                sess.headers["Referer"] = f"https://{host}/"
-            client = cls(host=host, timeout=timeout, session=sess)
+            if on_progress:
+                try:
+                    on_progress(host)
+                except Exception:  # noqa: BLE001
+                    pass
             try:
+                sess = cls._copy_session(base, host)
+                client = cls(host=host, timeout=timeout, session=sess)
                 data = client._fetch("film", {
                     "id": probe_id, "type": "film",
                     "linkType": "basic", "quality": "720",
@@ -167,6 +210,7 @@ class RezkaClient:
                 if isinstance(data, dict) and (data.get("items") or data.get("movieInfo")):
                     return host
             except Exception:  # noqa: BLE001
+                # DNS не резолвится, зеркала нет, таймаут, JS-challenge — пробуем следующее
                 continue
         return None
 
@@ -176,10 +220,28 @@ class RezkaClient:
     def _fetch(self, kind: str, params: dict) -> dict:
         url = API_URL.format(host=self.host, kind=kind)
         resp = self.session.get(url, params=params, timeout=self.timeout)
-        resp.raise_for_status()
+        # Статусы 401/403 и текст challenge-страницы — признак антибота;
+        # поднимаем AntiBotError вместо голодной HTTP-ошибки, чтобы GUI
+        # мог показать понятную подсказку про Cookie/зеркало.
+        status = getattr(resp, "status_code", 200)
+        text = ""
+        try:
+            text = resp.text
+        except Exception:  # noqa: BLE001
+            pass
+        if status in (401, 403, 429, 451, 503):
+            raise AntiBotError(
+                f"api.{self.host}: HTTP {status} — доступ закрыт "
+                "(антибот-защита или нужен рабочий Cookie)."
+            )
         try:
             data = resp.json()
         except ValueError as exc:
+            if looks_antibot(text):
+                raise AntiBotError(
+                    f"api.{self.host} вернул страницу антибот-проверки "
+                    "вместо JSON. Нужен Cookie из браузера или другое зеркало."
+                ) from None
             raise RuntimeError(
                 f"Хост api.{self.host} вернул не JSON (возможно, включена "
                 f"антибот-защита Anubis). Используйте другое зеркало — "

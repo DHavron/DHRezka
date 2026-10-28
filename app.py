@@ -39,7 +39,8 @@ except ImportError:  # rich необязателен
     Console = None
 
 from rezka.api import RezkaClient, parse_content_url, MIRROR_HOSTS
-from rezka.scraper import RezkaScraper, make_session
+from rezka.scraper import RezkaScraper
+from rezka.net import AntiBotError, make_session
 from rezka.player import play_or_download, available_players
 
 console = Console() if Console else None

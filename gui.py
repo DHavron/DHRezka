@@ -34,12 +34,14 @@ from urllib.parse import urlparse  # noqa: F401 (резерв)
 # --- сторонние модули проекта ------------------------------------------------
 try:
     from rezka.api import RezkaClient, MIRROR_HOSTS, parse_content_url
-    from rezka.scraper import RezkaScraper, make_session
+    from rezka.scraper import RezkaScraper
+    from rezka.net import AntiBotError, make_session
     from rezka.player import available_players, play_or_download
 except ImportError:  # запуск из другого каталога
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from rezka.api import RezkaClient, MIRROR_HOSTS, parse_content_url
-    from rezka.scraper import RezkaScraper, make_session
+    from rezka.scraper import RezkaScraper
+    from rezka.net import AntiBotError, make_session
     from rezka.player import available_players, play_or_download
 
 SETTINGS_DIR = Path.home() / ".rezka_gui"
@@ -217,7 +219,7 @@ class SettingsDialog(tk.Toplevel):
             self.dl_var.set(d)
 
     def _find_mirror(self):
-        """Фоновый перебор зеркал с текущими cookie/UA."""
+        """Фоновый перебор зеркал с текущими cookie/UA (с прогрессом по хостам)."""
         self.mirror_status.config(text="Проверяю…", foreground="gray")
         cookie = self.cookie_txt.get("1.0", "end").strip()
         ua = self.ua_var.get().strip()
@@ -227,7 +229,11 @@ class SettingsDialog(tk.Toplevel):
             sess = make_session(cookie_string=cookie or None, impersonate=imp)
             if ua:
                 sess.headers["User-Agent"] = ua
-            host = RezkaClient.find_working_host(session=sess, timeout=8)
+            host = RezkaClient.find_working_host(
+                session=sess, timeout=8,
+                on_progress=lambda h: self.after(
+                    0, lambda h=h: self.mirror_status.config(
+                        text=f"Проверяю {h}…", foreground="gray")))
             self.after(0, lambda: self._mirror_done(host))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -238,8 +244,9 @@ class SettingsDialog(tk.Toplevel):
             self.mirror_status.config(text=f"Рабочее зеркало: {host}",
                                       foreground="green")
         else:
-            self.mirror_status.config(text="Ни одно зеркало не отвечает",
-                                      foreground="red")
+            self.mirror_status.config(
+                text="Ни одно зеркало не отвечает — проверьте Cookie или сеть",
+                foreground="red")
 
     def _ok(self):
         self.result = {
@@ -273,6 +280,8 @@ class RezkaGUI(tk.Tk):
         self._build_body()
         self._build_statusbar()
 
+        self._mirrored_once = False   # флаг автопереключения на зеркало
+        self._retry_ctx = None
         self.after(100, self._poll_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.refresh_latest()
@@ -449,10 +458,18 @@ class RezkaGUI(tk.Tk):
         return sess
 
     def _run_async(self, fn, status: str, on_done):
-        """fn() выполняется в рабочем потоке; результат → on_done через очередь."""
+        """fn() выполняется в рабочем потоке; результат → on_done через очередь.
+
+        Если запрос упал из-за недоступного хоста/антибота — один раз
+        автоматически ищется рабочее зеркало и запрос повторяется.
+        """
         if self._busy:
             messagebox.showinfo("Занято", "Дождитесь завершения текущего запроса.")
             return
+        self._mirrored_once = False
+        self._start_task(fn, status, on_done)
+
+    def _start_task(self, fn, status: str, on_done, retrying=False):
         self._busy = True
         self._set_busy(True)
         self.status_var.set(status)
@@ -462,7 +479,8 @@ class RezkaGUI(tk.Tk):
                 res = fn()
                 self._q.put(("ok", res, on_done))
             except Exception as exc:  # noqa: BLE001
-                self._q.put(("err", exc, on_done))
+                payload = (exc, fn, on_done) if not retrying else (exc, None, on_done)
+                self._q.put(("err", payload, None))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -470,28 +488,111 @@ class RezkaGUI(tk.Tk):
         try:
             while True:
                 kind, payload, cb = self._q.get_nowait()
+                if kind == "mirror":
+                    self._on_mirror_found(payload)
+                    continue
                 self._busy = False
                 self._set_busy(False)
                 if kind == "ok":
-                    cb(payload)
+                    if cb:
+                        cb(payload)
                     self.status_var.set("Готово")
                 else:
-                    cb(None)
-                    msg = str(payload)
-                    self.status_var.set(f"Ошибка: {msg[:100]}")
-                    if "Anubis" in msg or "не JSON" in msg:
-                        msg += ("\n\nСкорее всего сайт закрыт антибот-защитой."
-                               " Откройте «⚙ Настройки» и укажите заголовок Cookie"
-                               " из браузера (или найдите рабочее зеркало).")
-                    messagebox.showerror("Ошибка", msg)
+                    exc, fn, on_done = payload
+                    # автопереключение на зеркало при недоступности хоста
+                    if (fn is not None and self._auto_mirror_needed(exc)
+                            and not self._mirrored_once):
+                        self._mirrored_once = True
+                        self._retry_ctx = (fn, on_done)
+                        self._mirror_task(
+                            self._retry_last_request,
+                            f"Хост {self.settings['host']} недоступен — ищу зеркало…")
+                        continue
+                    self._mirrored_once = False
+                    if on_done:
+                        on_done(None)
+                    self._show_error(exc)
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
 
+    def _retry_last_request(self):
+        """Повторить последнюю задачу уже на новом зеркале."""
+        ctx = getattr(self, "_retry_ctx", None)
+        self._retry_ctx = None
+        if ctx is None:
+            return
+        fn, on_done = ctx
+        self._start_task(fn, f"Повторяю запрос на {self.settings['host']}…",
+                         on_done, retrying=True)
+
+    def _show_error(self, exc: Exception):
+        """Понятные сообщения об ошибках вместо «ничего не происходит»."""
+        msg = str(exc) or exc.__class__.__name__
+        low = msg.lower()
+        if "anubis" in low or "антибот" in low or "не json" in low \
+                or isinstance(exc, AntiBotError):
+            msg += ("\n\nСайт закрыт антибот-защитой. Что делать:\n"
+                    "1. Откройте сайт в браузере, дождитесь окончания проверки.\n"
+                    "2. F12 → Network → запрос к сайту → скопируйте заголовок Cookie.\n"
+                    "3. ⚙ Настройки → вставьте в поле «Заголовок Cookie» → Сохранить.\n"
+                    "Либо нажмите «🔎 Найти рабочее зеркало» в настройках.")
+        elif "failed to resolve" in low or "nameresolution" in low \
+                or "getaddrinfo" in low or "temporarily failed dns" in low:
+            msg += ("\n\nДомен не определяется (DNS/провайдер блокирует). "
+                    "Попробуйте другое зеркало в ⚙ Настройках "
+                    "(например, rezka.pub или rezka.art).")
+        elif "ssl" in low or "certificate" in low:
+            msg += "\n\nПроблема с TLS-сертификатом — попробуйте отключить " \
+                   "TLS-имперсонацию в настройках или сменить зеркало."
+        elif isinstance(exc, TimeoutError) or "timed out" in low:
+            msg += "\n\nПревышен таймаут — проверьте интернет или смените зеркало."
+        self.status_var.set(f"Ошибка: {msg.splitlines()[0][:100]}")
+        messagebox.showerror("Ошибка", msg)
+
     def _set_busy(self, busy: bool):
-        state = "disabled" if busy else "normal"
         for b in (self.btn_play, self.btn_download, self.btn_copy):
             b.state(["!disabled"] if not busy else ["disabled"])
+
+    # ---------------- автопереключение на рабочее зеркало --------------- #
+    def _auto_mirror_needed(self, exc: Exception) -> bool:
+        """Ошибки, при которых есть смысл автоматически поискать зеркало."""
+        if isinstance(exc, AntiBotError):
+            return True
+        low = str(exc).lower()
+        return any(s in low for s in ("failed to resolve", "getaddrinfo",
+                                      "nameresolution", "не json"))
+
+    def _mirror_task(self, retry_cb, note: str):
+        """Фоновый поиск зеркала; после нахождения меняет host и вызывает retry_cb()."""
+        def work():
+            sess = self._make_session()
+            found = RezkaClient.find_working_host(session=sess, timeout=8)
+            self._q.put(("mirror", found, None))
+        self._busy = True
+        self._set_busy(True)
+        self.status_var.set(note)
+        self._retry_cb = retry_cb
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_mirror_found(self, host):
+        self._busy = False
+        self._set_busy(False)
+        cb = getattr(self, "_retry_cb", None)
+        self._retry_cb = None
+        if host:
+            self.settings["host"] = host
+            save_settings(self.settings)
+            self._host_text.set(f"Хост: {host}")
+            self.status_var.set(f"Переключено на зеркало: {host}")
+            if cb:
+                cb()
+        else:
+            messagebox.showwarning(
+                "Зеркало не найдено",
+                "Ни одно известное зеркало не отвечает.\n\n"
+                "Проверьте подключение к интернету и обновите Cookie из "
+                "браузера (⚙ Настройки → «Заголовок Cookie»).")
 
     # ========================= действия списка ========================== #
     def _fill_tree(self, items, heading_note=""):
@@ -502,6 +603,27 @@ class RezkaGUI(tk.Tk):
                              text=heading_note or "▸")
         self.status_var.set(f"Найдено: {len(items)} {heading_note}".strip())
 
+    def _html_list_done(self, on_fill):
+        """Обёртка результата HTML-парсинга: пусто → понятная подсказка."""
+        def done(items):
+            if items is None:      # ошибка уже показала _poll_queue
+                return
+            if len(items) == 0:
+                self.status_var.set("Список пуст")
+                messagebox.showwarning(
+                    "Ничего не найдено",
+                    "Страница загрузилась, но карточки не найдены.\n\n"
+                    "Возможные причины:\n"
+                    "• Cookie устарели или скопированы не полностью "
+                    "(нужны все пары «name=value;» из DevTools);\n"
+                    "• сайт отвечает страницей проверки вместо выдачи;\n"
+                    "• изменилась разметка страницы.\n\n"
+                    "Попробуйте обновить Cookie в ⚙ Настройках или найти "
+                    "рабочее зеркало.")
+                return
+            on_fill(items)
+        return done
+
     def do_search(self):
         query = self.search_var.get().strip()
         if not query:
@@ -509,28 +631,32 @@ class RezkaGUI(tk.Tk):
         scraper = RezkaScraper(base_url=f"https://{self.settings['host']}",
                                session=self._make_session())
         self._run_async(lambda: scraper.search(query),
-                        f"Ищу «{query}»…", self._fill_tree)
+                        f"Ищу «{query}»…",
+                        self._html_list_done(self._fill_tree))
 
     def refresh_latest(self):
         scraper = RezkaScraper(base_url=f"https://{self.settings['host']}",
                                session=self._make_session())
         self._run_async(scraper.latest_updates,
                         "Загружаю новинки…",
-                        lambda items: self._fill_tree(items, "новинки"))
+                        self._html_list_done(
+                            lambda items: self._fill_tree(items, "новинки")))
 
     def refresh_top_films(self):
         scraper = RezkaScraper(base_url=f"https://{self.settings['host']}",
                                session=self._make_session())
         self._run_async(scraper.top_movies,
                         "Загружаю ТОП-100 фильмов…",
-                        lambda items: self._fill_tree(items, "ТОП фильмы"))
+                        self._html_list_done(
+                            lambda items: self._fill_tree(items, "ТОП фильмы")))
 
     def refresh_top_serials(self):
         scraper = RezkaScraper(base_url=f"https://{self.settings['host']}",
                                session=self._make_session())
         self._run_async(scraper.top_serials,
                         "Загружаю ТОП-100 сериалов…",
-                        lambda items: self._fill_tree(items, "ТОП сериалы"))
+                        self._html_list_done(
+                            lambda items: self._fill_tree(items, "ТОП сериалы")))
 
     # ========================== карточка фильма ========================= #
     def on_open_item(self):
