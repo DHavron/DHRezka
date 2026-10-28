@@ -131,9 +131,15 @@ class RezkaClient:
     def __init__(self, host: str = "rezka-ua.tv",
                  session: Optional[requests.Session] = None, timeout: int = 20):
         self.host = host
-        self.session = session or requests.Session()
-        self.session.headers.update(DEFAULT_HEADERS)
-        self.session.headers["Referer"] = f"https://{host}/"
+        sess = session or requests.Session()
+        # Не перетирать пользовательские заголовки (Cookie/UA из GUI-настроек),
+        # если сессия уже была настроена через scraper.make_session().
+        for k, v in DEFAULT_HEADERS.items():
+            if k not in sess.headers:
+                sess.headers[k] = v
+        if "Referer" not in sess.headers:
+            sess.headers["Referer"] = f"https://{host}/"
+        self.session = sess
         self.timeout = timeout
 
     # ------------------------------------------------------------------ #
@@ -141,10 +147,18 @@ class RezkaClient:
     # ------------------------------------------------------------------ #
     @classmethod
     def find_working_host(cls, hosts: Optional[list[str]] = None,
-                          probe_id: int = 10409, timeout: int = 10) -> Optional[str]:
+                          probe_id: int = 10409, timeout: int = 10,
+                          session: Optional[requests.Session] = None) -> Optional[str]:
         """Перебрать зеркала и вернуть первое, чей API отвечает валидным JSON."""
         for host in (hosts or MIRROR_HOSTS):
-            client = cls(host=host, timeout=timeout)
+            # каждая проба — со своей копией заголовков Referer
+            sess = None
+            if session is not None:
+                sess = requests.Session()
+                sess.headers.update(dict(session.headers))
+                sess.cookies.update(session.cookies)
+                sess.headers["Referer"] = f"https://{host}/"
+            client = cls(host=host, timeout=timeout, session=sess)
             try:
                 data = client._fetch("film", {
                     "id": probe_id, "type": "film",

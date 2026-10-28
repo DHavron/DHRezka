@@ -4,3 +4,7 @@ lxml>=4.9
 rich>=13.0        # опционально: красивые таблицы в терминале
 curl_cffi>=0.6    # опционально: TLS-имперсонация Chrome (обход части защит)
 cloudscraper>=1.2 # опционально: обход Cloudflare на некоторых зеркалах
+
+# --- GUI (gui.py) ---
+# tkinter входит в стандартную библиотеку Python, но в Debian/Ubuntu
+# отдельным пакетом:  sudo apt install python3-tk
