@@ -58,9 +58,23 @@ class RezkaScraper:
         try:
             raise_for_antibot(resp)
         except AntiBotError as exc:
+            hint = ""
+            cookie = ""
+            try:
+                cookie = self.session.headers.get("Cookie", "") or ""
+            except Exception:  # noqa: BLE001
+                pass
+            m = re.search(r"([\w.-]+)-anubis-auth-", cookie)
+            cur_host = re.sub(r"^https?://", "", self.base_url).split("/")[0]
+            if m and m.group(1) != cur_host:
+                hint = (f" Ваши Cookie выданы для домена «{m.group(1)}», а запрос "
+                        f"идёт к «{cur_host}» — откройте в ⚙ Настройках то же "
+                        f"зеркало, где копировали Cookie.")
+            elif not cookie:
+                hint = " Cookie не заданы — вставьте их в ⚙ Настройках."
             raise AntiBotError(
-                f"{exc} Передайте cookies из браузера (Настройки → «Заголовок "
-                "Cookie»), используйте зеркало или пройдите проверку в браузере."
+                f"{exc}.{hint} Обновите Cookie (F12 → Network → заголовок "
+                "Cookie целиком) или используйте зеркало без проверки."
             ) from None
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
