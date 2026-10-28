@@ -31,17 +31,21 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import urlparse  # noqa: F401 (резерв)
 
+from typing import Optional
+
 # --- сторонние модули проекта ------------------------------------------------
 try:
     from rezka.api import RezkaClient, MIRROR_HOSTS, parse_content_url
     from rezka.scraper import RezkaScraper
-    from rezka.net import AntiBotError, make_session
+    from rezka.net import (AntiBotError, make_session, clean_cookie_string,
+                           check_cookie, decode_anubis_jwt)
     from rezka.player import available_players, play_or_download
 except ImportError:  # запуск из другого каталога
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from rezka.api import RezkaClient, MIRROR_HOSTS, parse_content_url
     from rezka.scraper import RezkaScraper
-    from rezka.net import AntiBotError, make_session
+    from rezka.net import (AntiBotError, make_session, clean_cookie_string,
+                           check_cookie, decode_anubis_jwt)
     from rezka.player import available_players, play_or_download
 
 SETTINGS_DIR = Path.home() / ".rezka_gui"
@@ -122,18 +126,28 @@ class SettingsDialog(tk.Toplevel):
         self.cookie_txt.insert("1.0", self.settings.get("cookie", ""))
 
         hint = ("Скопируйте из браузера: F12 → Network → запрос к сайту →\n"
-                "Request Headers → Cookie. Нужен, если сайт закрыт Anubis.")
+                "Request Headers → Cookie (значение целиком). Можно вставить\n"
+                "и с «Cookie:»/кавычками — программа очистит сама.")
         ttk.Label(frm, text=hint, foreground="gray",
                   justify="left").grid(row=row, column=1, sticky="w", **pad)
         row += 1
 
         btns = ttk.Frame(frm)
         btns.grid(row=row, column=1, sticky="w", **pad)
+        ttk.Button(btns, text="Проверить", command=self._check_cookie_now) \
+            .pack(side="left", padx=(0, 4))
         ttk.Button(btns, text="Из файла…", command=self._load_cookie_file)\
             .pack(side="left", padx=(0, 4))
         ttk.Button(btns, text="Очистить", command=lambda: self.cookie_txt.delete("1.0", "end"))\
             .pack(side="left")
         row += 1
+
+        self.cookie_status = ttk.Label(frm, text="", foreground="gray",
+                                       wraplength=420, justify="left")
+        self.cookie_status.grid(row=row, column=1, sticky="w", **pad)
+        row += 1
+        if self.settings.get("cookie"):
+            self.after(150, lambda: self._check_cookie_now(silent=True))
 
         ttk.Separator(frm).grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
         row += 1
@@ -188,6 +202,47 @@ class SettingsDialog(tk.Toplevel):
         frm.columnconfigure(1, weight=1)
 
     # ------------------------------------------------------------------ #
+    def _cookie_text(self) -> str:
+        return clean_cookie_string(self.cookie_txt.get("1.0", "end"))
+
+    def _check_cookie_now(self, silent: bool = False):
+        """Проверить вставленные Cookie: полнота, Anubis-токен, срок, домен.
+
+        Возвращает список предупреждений (пустой — куки выглядят хорошо).
+        """
+        raw = self._cookie_text()
+        host = self.host_var.get().strip()
+        warnings = check_cookie(raw, host=host)
+        if not warnings and not silent:
+            payload = decode_anubis_jwt(raw) or {}
+            exp = payload.get("exp")
+            until = ""
+            if isinstance(exp, (int, float)):
+                import datetime as _dt
+                d = _dt.datetime.fromtimestamp(exp)
+                until = f" Действуют до {d:%d.%m.%Y %H:%M}."
+            self.cookie_status.config(
+                text=f"✔ Cookie в порядке: токен Anubis найден.{until}",
+                foreground="green")
+        elif warnings:
+            self.cookie_status.config(text="⚠ " + "\n⚠ ".join(warnings),
+                                      foreground="#b35a00")
+        return warnings
+
+    def _apply_host_from_cookie(self):
+        """Если Cookie выданы другому зеркалу — предложить сменить хост."""
+        payload_host = None
+        m = re.search(r"[;\s]?([\w.-]+?)-anubis-auth-([\w.-]+)=", " " + self._cookie_text())
+        if m:
+            payload_host = m.group(2)
+        if payload_host and payload_host != self.host_var.get().strip():
+            if messagebox.askyesno(
+                    "Cookie с другого зеркала",
+                    f"Ваши Cookie выданы для домена «{payload_host}»,\n"
+                    f"а выбран хост «{self.host_var.get().strip()}». "
+                    f"Переключить хост на «{payload_host}»?"):
+                self.host_var.set(payload_host)
+
     def _load_cookie_file(self):
         path = filedialog.askopenfilename(
             title="Файл с cookies (обычный текст или Netscape cookies.txt)",
@@ -221,7 +276,7 @@ class SettingsDialog(tk.Toplevel):
     def _find_mirror(self):
         """Фоновый перебор зеркал с текущими cookie/UA (с прогрессом по хостам)."""
         self.mirror_status.config(text="Проверяю…", foreground="gray")
-        cookie = self.cookie_txt.get("1.0", "end").strip()
+        cookie = self._cookie_text()
         ua = self.ua_var.get().strip()
         imp = self.imp_var.get()
 
@@ -245,13 +300,24 @@ class SettingsDialog(tk.Toplevel):
                                       foreground="green")
         else:
             self.mirror_status.config(
-                text="Ни одно зеркало не отвечает — проверьте Cookie или сеть",
+                text="Ни одно зеркало не отвечает — проверьте сеть/DNS или "
+                     "вставьте актуальные Cookie (кнопка «Проверить»)",
                 foreground="red")
 
     def _ok(self):
+        # нормализуем cookie («Cookie:», кавычки, переводы строк — не страшно)
+        cookie = self._cookie_text()
+        warnings = check_cookie(cookie, host=self.host_var.get().strip())
+        if warnings and not messagebox.askyesno(
+                "Cookie под вопросом",
+                "При проверке Cookie есть замечания:\n\n• " + "\n• ".join(warnings) +
+                "\n\nСохранить всё равно?"):
+            return
+        # если куки с другого зеркала — предложить переключить хост
+        self._apply_host_from_cookie()
         self.result = {
             "host": self.host_var.get().strip() or DEFAULT_SETTINGS["host"],
-            "cookie": self.cookie_txt.get("1.0", "end").strip(),
+            "cookie": cookie,
             "user_agent": self.ua_var.get().strip(),
             "quality": self.q_var.get(),
             "player": self.p_var.get(),
@@ -457,6 +523,26 @@ class RezkaGUI(tk.Tk):
             sess.headers["User-Agent"] = s["user_agent"]
         return sess
 
+    def _cookie_domain_mismatch(self) -> Optional[str]:
+        """Домен, которому выданы Anubis-cookie, если он != текущий хост."""
+        cookie = self.settings.get("cookie") or ""
+        m = re.search(r"([\w.-]+)-anubis-auth-", cookie)
+        if m and m.group(1) != self.settings.get("host"):
+            return m.group(1)
+        return None
+
+    def _auto_switch_cookie_host(self) -> bool:
+        """Куки с другого зеркала → молча переключаемся на него (один раз)."""
+        host = self._cookie_domain_mismatch()
+        if not host:
+            return False
+        self.settings["host"] = host
+        save_settings(self.settings)
+        self._host_text.set(f"Хост: {host}")
+        self.status_var.set(
+            f"Cookie выданы для «{host}» — переключил хост автоматически")
+        return True
+
     def _run_async(self, fn, status: str, on_done):
         """fn() выполняется в рабочем потоке; результат → on_done через очередь.
 
@@ -484,6 +570,61 @@ class RezkaGUI(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _html_task(self, fetch, status: str, fill):
+        """HTML-запрос с повтором на свежей сессии.
+
+        Первая попытка идёт на «сырой» TLS-сессии без предварительного
+        визита; если антибот ответил challenge — повторяем тот же запрос
+        после прогрева (открываем главную, чтобы доустановить cookies),
+        затем уже показываем ошибку/пустой список.
+        """
+        state = {"attempt": 0}
+
+        def run():
+            host = self.settings["host"]
+            sess = self._make_session()
+            if state["attempt"] == 1:          # прогрев: главная → cookies
+                try:
+                    sess.get(f"https://{host}/", timeout=25)
+                except Exception:  # noqa: BLE001
+                    pass
+            scraper = RezkaScraper(base_url=f"https://{host}", session=sess)
+            return fetch(scraper)
+
+        def done(items):
+            if items is None:                  # ошибка — обработал _poll_queue
+                return
+            if len(items) == 0 and state["attempt"] == 0:
+                state["attempt"] = 1
+                self._start_task(run, "Повторяю запрос после прогрева…", done)
+                return
+            if len(items) == 0:
+                self._empty_list_help()
+                return
+            fill(items)
+
+        self._start_task(run, status, done)
+
+    def _empty_list_help(self):
+        mismatch = self._cookie_domain_mismatch()
+        reasons = [
+            f"• страница зеркала «{self.settings['host']}» открылась, но "
+            "карточек в разметке нет;",
+            "• Cookie устарели — откройте сайт в браузере заново и "
+            "скопируйте заголовок Cookie целиком (⚙ Настройки);",
+            "• изменилась вёрстка сайта.",
+        ]
+        if mismatch:
+            reasons.insert(0, f"• ваши Cookie выданы для «{mismatch}», а "
+                              f"запрос шёл к «{self.settings['host']}».")
+        self.status_var.set("Список пуст")
+        messagebox.showwarning(
+            "Ничего не найдено",
+            "Страница загрузилась, но карточки не найдены.\n\nВозможные "
+            "причины:\n" + "\n".join(reasons) +
+            "\n\nПроверьте Cookie кнопкой «Проверить» в ⚙ Настройках или "
+            "найдите рабочее зеркало.")
+
     def _poll_queue(self):
         try:
             while True:
@@ -499,7 +640,15 @@ class RezkaGUI(tk.Tk):
                     self.status_var.set("Готово")
                 else:
                     exc, fn, on_done = payload
-                    # автопереключение на зеркало при недоступности хоста
+                    # 1) Cookie выданы другому зеркалу → переключаемся на него
+                    if (fn is not None and self._cookie_domain_mismatch()
+                            and not getattr(self, "_host_switched_once", False)):
+                        self._host_switched_once = True
+                        self._auto_switch_cookie_host()
+                        self._retry_ctx = (fn, on_done)
+                        self._retry_last_request()
+                        continue
+                    # 2) хост недоступен / антибот → один раз ищем зеркало
                     if (fn is not None and self._auto_mirror_needed(exc)
                             and not self._mirrored_once):
                         self._mirrored_once = True
@@ -509,6 +658,7 @@ class RezkaGUI(tk.Tk):
                             f"Хост {self.settings['host']} недоступен — ищу зеркало…")
                         continue
                     self._mirrored_once = False
+                    self._host_switched_once = False
                     if on_done:
                         on_done(None)
                     self._show_error(exc)
@@ -603,60 +753,28 @@ class RezkaGUI(tk.Tk):
                              text=heading_note or "▸")
         self.status_var.set(f"Найдено: {len(items)} {heading_note}".strip())
 
-    def _html_list_done(self, on_fill):
-        """Обёртка результата HTML-парсинга: пусто → понятная подсказка."""
-        def done(items):
-            if items is None:      # ошибка уже показала _poll_queue
-                return
-            if len(items) == 0:
-                self.status_var.set("Список пуст")
-                messagebox.showwarning(
-                    "Ничего не найдено",
-                    "Страница загрузилась, но карточки не найдены.\n\n"
-                    "Возможные причины:\n"
-                    "• Cookie устарели или скопированы не полностью "
-                    "(нужны все пары «name=value;» из DevTools);\n"
-                    "• сайт отвечает страницей проверки вместо выдачи;\n"
-                    "• изменилась разметка страницы.\n\n"
-                    "Попробуйте обновить Cookie в ⚙ Настройках или найти "
-                    "рабочее зеркало.")
-                return
-            on_fill(items)
-        return done
-
     def do_search(self):
         query = self.search_var.get().strip()
         if not query:
             return
-        scraper = RezkaScraper(base_url=f"https://{self.settings['host']}",
-                               session=self._make_session())
-        self._run_async(lambda: scraper.search(query),
+        self._html_task(lambda sc: sc.search(query),
                         f"Ищу «{query}»…",
-                        self._html_list_done(self._fill_tree))
+                        lambda items: self._fill_tree(items))
 
     def refresh_latest(self):
-        scraper = RezkaScraper(base_url=f"https://{self.settings['host']}",
-                               session=self._make_session())
-        self._run_async(scraper.latest_updates,
+        self._html_task(lambda sc: sc.latest_updates(),
                         "Загружаю новинки…",
-                        self._html_list_done(
-                            lambda items: self._fill_tree(items, "новинки")))
+                        lambda items: self._fill_tree(items, "новинки"))
 
     def refresh_top_films(self):
-        scraper = RezkaScraper(base_url=f"https://{self.settings['host']}",
-                               session=self._make_session())
-        self._run_async(scraper.top_movies,
+        self._html_task(lambda sc: sc.top_movies(),
                         "Загружаю ТОП-100 фильмов…",
-                        self._html_list_done(
-                            lambda items: self._fill_tree(items, "ТОП фильмы")))
+                        lambda items: self._fill_tree(items, "ТОП фильмы"))
 
     def refresh_top_serials(self):
-        scraper = RezkaScraper(base_url=f"https://{self.settings['host']}",
-                               session=self._make_session())
-        self._run_async(scraper.top_serials,
+        self._html_task(lambda sc: sc.top_serials(),
                         "Загружаю ТОП-100 сериалов…",
-                        self._html_list_done(
-                            lambda items: self._fill_tree(items, "ТОП сериалы")))
+                        lambda items: self._fill_tree(items, "ТОП сериалы"))
 
     # ========================== карточка фильма ========================= #
     def on_open_item(self):

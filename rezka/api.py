@@ -219,37 +219,86 @@ class RezkaClient:
     # ------------------------------------------------------------------ #
     def _fetch(self, kind: str, params: dict) -> dict:
         url = API_URL.format(host=self.host, kind=kind)
+        # XHR-запрос (X-Requested-With) при закрытом доступе отдаёт голые
+        # 401/403 без HTML — их нельзя ловить по тексту страницы, поэтому
+        # такие статусы считаем антиботом сразу.
+        xhr = "XMLHttpRequest" in self.session.headers.get(
+            "X-Requested-With", "")
         resp = self.session.get(url, params=params, timeout=self.timeout)
-        # Статусы 401/403 и текст challenge-страницы — признак антибота;
-        # поднимаем AntiBotError вместо голодной HTTP-ошибки, чтобы GUI
-        # мог показать понятную подсказку про Cookie/зеркало.
         status = getattr(resp, "status_code", 200)
         text = ""
         try:
             text = resp.text
         except Exception:  # noqa: BLE001
             pass
-        if status in (401, 403, 429, 451, 503):
+        if status in (401, 403):
+            hint = self._cookie_hint()
             raise AntiBotError(
                 f"api.{self.host}: HTTP {status} — доступ закрыт "
-                "(антибот-защита или нужен рабочий Cookie)."
+                "(антибот Anubis / нужен рабочий Cookie)." + hint
             )
+        if status in (429, 451, 503):
+            raise AntiBotError(
+                f"api.{self.host}: HTTP {status} — запросов слишком много "
+                "или доступ ограничен. Повторите позже или смените зеркало."
+            )
+        if status >= 400 and not text.strip():
+            raise AntiBotError(
+                f"api.{self.host}: HTTP {status} без ответа — скорее всего "
+                "API недоступен с текущими Cookie." + self._cookie_hint()
+            )
+        # JSON-ответы XHR иногда содержат сообщение об ошибке вместо данных
+        data = None
+        ctype = ""
+        try:
+            ctype = resp.headers.get("Content-Type", "")
+        except Exception:  # noqa: BLE001
+            pass
         try:
             data = resp.json()
-        except ValueError as exc:
+        except ValueError:
             if looks_antibot(text):
                 raise AntiBotError(
                     f"api.{self.host} вернул страницу антибот-проверки "
-                    "вместо JSON. Нужен Cookie из браузера или другое зеркало."
+                    "вместо JSON. Нужен свежий Cookie того же зеркала, что "
+                    "выбран в настройках." + self._cookie_hint()
                 ) from None
+            if xhr and status == 200 and "json" not in ctype.lower():
+                raise AntiBotError(
+                    f"api.{self.host}: ответ не является JSON (Content-Type: "
+                    f"{ctype or 'нет'}). Похоже на блокировку запроса "
+                    "(обновите Cookie или смените зеркало).")
             raise RuntimeError(
                 f"Хост api.{self.host} вернул не JSON (возможно, включена "
                 f"антибот-защита Anubis). Используйте другое зеркало — "
                 f"RezkaClient.find_working_host()"
-            ) from exc
+            ) from None
         if isinstance(data, dict) and data.get("error"):
+            err = str(data["error"]).lower()
+            if any(w in err for w in ("auth", "forbidden", "denied",
+                                      "robot", "anubis")):
+                raise AntiBotError(
+                    f"api.{self.host}: отказ доступа ({data['error']}). "
+                    "Обновите Cookie из браузера." + self._cookie_hint())
             raise RuntimeError(f"Ошибка API: {data['error']}")
         return data
+
+    def _cookie_hint(self) -> str:
+        """Подсказка про совпадение домена cookie и текущего хоста."""
+        try:
+            cookie = self.session.headers.get("Cookie", "") or ""
+        except Exception:  # noqa: BLE001
+            cookie = ""
+        m = re.search(r"([\w.-]+)-anubis-auth-", cookie)
+        if m and m.group(1) != self.host:
+            return (f"\n\nВажно: ваши Cookie выданы для домена «{m.group(1)}», "
+                    f"а запрос идёт к «{self.host}». Скопируйте Cookie на том "
+                    f"же зеркале, которое выбрано в настройках, или смените "
+                    f"хост на «{m.group(1)}».")
+        if not cookie:
+            return ("\n\nCookie не заданы: ⚙ Настройки → «Заголовок Cookie» → "
+                    "вставьте значение из DevTools браузера.")
+        return ""
 
     # ------------------------------------------------------------------ #
     # Список переводов (linkType=basic)
